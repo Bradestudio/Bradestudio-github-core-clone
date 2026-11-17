@@ -33,6 +33,8 @@ export interface Issue {
   comments: Comment[];
   createdAt: string;
   updatedAt: string;
+  /** Cached serialisation of issueJson (text + Buffer); null when stale. */
+  jsonCache: { text: string; buf: Buffer; viewer: string } | null;
 }
 
 export interface Pull {
@@ -71,6 +73,12 @@ export interface Repo {
   nextIssue: number;
   nextPull: number;
   nextComment: number;
+  /** Bumped on every ref mutation; caches below are valid only at this version. */
+  refsVersion: number;
+  /** Cached smart-HTTP advertisements, valid at refsVersion. */
+  adCache: { version: number; v2: Buffer; v0up: Buffer; v0recv: Buffer } | null;
+  /** Cached ls-refs response (single entry), valid at refsVersion. */
+  lsCache: { version: number; key: string; buf: Buffer } | null;
 }
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -128,6 +136,9 @@ export class Store {
       nextIssue: 1,
       nextPull: 1,
       nextComment: 1,
+      refsVersion: 0,
+      adCache: null,
+      lsCache: null,
     };
     this.repos.set(name, repo);
     return repo;
@@ -183,6 +194,7 @@ export class Store {
       comments: [],
       createdAt: stamp,
       updatedAt: stamp,
+      jsonCache: null,
     };
     repo.nextIssue += 1;
     repo.issues.push(issue);

@@ -406,6 +406,27 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   }
   if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
 
+  // Fast path: a pack with no delta entries needs no resolution machinery —
+  // a plain object's oid is just its type + data hash, as below. Behaviour
+  // is identical to the general path for such packs (same oids, same order,
+  // same first-wins dedup); delta packs still take the general path.
+  let hasDelta = false;
+  for (const entry of raw) {
+    if (entry.typeCode === 6 || entry.typeCode === 7) {
+      hasDelta = true;
+      break;
+    }
+  }
+  if (!hasDelta) {
+    const plain = new Map<string, GitObject>();
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode]!;
+      const oid = hashObject(type, entry.data);
+      if (!plain.has(oid)) plain.set(oid, { type, data: entry.data });
+    }
+    return plain;
+  }
+
   const objects = new Map<string, GitObject>();
   const resolvedByOid = new Map<string, Raw>();
   const resolving = new Set<number>();
@@ -786,35 +807,58 @@ export function defaultTip(repo: Repo): string {
   return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? ZERO_OID;
 }
 
+/** Build all three advertisements in one pass (shared ref listing). */
+function buildAdvertisements(repo: Repo): { version: number; v2: Buffer; v0up: Buffer; v0recv: Buffer } {
+  const version = repo.refsVersion;
+  const tip = defaultTip(repo);
+  const refs = refLines(repo);
+  const v2Chunks: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
+  v2Chunks.push(pktLine('version 2\n'));
+  v2Chunks.push(pktLine(`agent=${AGENT}\n`));
+  v2Chunks.push(pktLine('ls-refs=unborn\n'));
+  v2Chunks.push(pktLine('fetch=shallow\n'));
+  v2Chunks.push(pktLine('object-format=sha1\n'));
+  v2Chunks.push(PKT_FLUSH);
+  const buildV0 = (service: 'git-upload-pack' | 'git-receive-pack'): Buffer => {
+    const caps =
+      service === 'git-receive-pack'
+        ? `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`
+        : `side-band-64k ofs-delta multi_ack multi_ack_detailed thin-pack shallow agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`;
+    const chunks: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
+    if (refs.length === 0) {
+      chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    } else {
+      chunks.push(pktLine(`${tip} HEAD\0${caps}\n`));
+      for (const ref of refs) chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
+    }
+    chunks.push(PKT_FLUSH);
+    return Buffer.concat(chunks);
+  };
+  return { version, v2: Buffer.concat(v2Chunks), v0up: buildV0('git-upload-pack'), v0recv: buildV0('git-receive-pack') };
+}
+
+/**
+ * The three advertisements, cached per repo at its refsVersion: an
+ * advertisement is a pure function of the ref set, so a clone workload's
+ * 50 identical ls-refs/advertisement requests share one build. Any ref
+ * mutation bumps refsVersion and drops the cache.
+ */
+function advertisements(repo: Repo): { version: number; v2: Buffer; v0up: Buffer; v0recv: Buffer } {
+  const cached = repo.adCache;
+  if (cached !== null && cached.version === repo.refsVersion) return cached;
+  const built = buildAdvertisements(repo);
+  repo.adCache = built;
+  return built;
+}
+
 /** v2 capability advertisement for git-upload-pack. */
 export function advertiseUploadPackV2(repo: Repo): Buffer {
-  const chunks: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
-  chunks.push(pktLine('version 2\n'));
-  chunks.push(pktLine(`agent=${AGENT}\n`));
-  chunks.push(pktLine('ls-refs=unborn\n'));
-  chunks.push(pktLine('fetch=shallow\n'));
-  chunks.push(pktLine('object-format=sha1\n'));
-  chunks.push(PKT_FLUSH);
-  return Buffer.concat(chunks);
+  return advertisements(repo).v2;
 }
 
 /** v0 ref advertisement for a service (upload-pack or receive-pack). */
 export function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
-  const caps =
-    service === 'git-receive-pack'
-      ? `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`
-      : `side-band-64k ofs-delta multi_ack multi_ack_detailed thin-pack shallow agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`;
-  const chunks: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
-  const tip = defaultTip(repo);
-  const refs = refLines(repo);
-  if (refs.length === 0) {
-    chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  } else {
-    chunks.push(pktLine(`${tip} HEAD\0${caps}\n`));
-    for (const ref of refs) chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
-  }
-  chunks.push(PKT_FLUSH);
-  return Buffer.concat(chunks);
+  return service === 'git-receive-pack' ? advertisements(repo).v0recv : advertisements(repo).v0up;
 }
 
 interface LsRefsArgs {
@@ -842,6 +886,11 @@ export function handleLsRefs(repo: Repo, body: Buffer): Buffer {
     else if (text === 'unborn') args.unborn = true;
     else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
   }
+  // The answer is a pure function of the ref set + these args: cache it per
+  // repo version (a clone workload's 50 identical ls-refs share one build).
+  const cacheKey = `${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const cached = repo.lsCache;
+  if (cached !== null && cached.version === repo.refsVersion && cached.key === cacheKey) return cached.buf;
   const chunks: Buffer[] = [];
   const tip = defaultTip(repo);
   const refs = refLines(repo);
@@ -867,7 +916,9 @@ export function handleLsRefs(repo: Repo, body: Buffer): Buffer {
     }
   }
   chunks.push(PKT_FLUSH);
-  return Buffer.concat(chunks);
+  const out = Buffer.concat(chunks);
+  repo.lsCache = { version: repo.refsVersion, key: cacheKey, buf: out };
+  return out;
 }
 
 interface FetchArgs {
@@ -1116,7 +1167,10 @@ export function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     report.push({ ref: command.ref, ok: true, reason: '' });
     changed = true;
   }
-  if (changed) clearFetchCache();
+  if (changed) {
+    repo.refsVersion += 1;
+    clearFetchCache();
+  }
   return framePushReport(true, 'ok', report);
 }
 

@@ -15,7 +15,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { store } from './store.ts';
-import { handleRest } from './api.ts';
+import { createIssueResult, getIssueResult, handleRest } from './api.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import {
@@ -28,6 +28,9 @@ import {
 } from './git.ts';
 
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+/** Shared empty query: handleRest only reads it, so one instance is safe. */
+const EMPTY_QUERY = new URLSearchParams();
 
 let requestCounter = 0;
 
@@ -67,11 +70,12 @@ function sendJson(res: ServerResponse, status: number, value: unknown, extraHead
   res.end(body);
 }
 
-function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer, extraHeaders?: Record<string, string>): void {
   res.writeHead(status, {
     'content-type': contentType,
     'x-github-request-id': nextRequestId(),
     'content-length': body.length,
+    ...(extraHeaders ?? {}),
   });
   res.end(body);
 }
@@ -103,6 +107,32 @@ function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok: false 
   }
 }
 
+/** Read a JSON request body as text: one string concat, no Buffer round-trip. */
+function readTextBody(req: IncomingMessage): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    req.setEncoding('utf8');
+    let text = '';
+    req.on('data', (chunk: string) => {
+      text += chunk;
+      if (text.length > 256 * 1024 * 1024) {
+        reject(new Error('request body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(text));
+    req.on('error', reject);
+  });
+}
+
+function parseJsonText(raw: string): { ok: true; value: unknown } | { ok: false } {
+  if (raw.length === 0) return { ok: true, value: null };
+  try {
+    return { ok: true, value: JSON.parse(raw) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
 function splitPath(pathname: string): string[] {
   return pathname.split('/').filter((segment) => segment !== '');
 }
@@ -120,8 +150,13 @@ export function createApp(): ReturnType<typeof createServer> {
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-  const pathname = url.pathname;
+  // Manual URL split: `new URL` is pure overhead on this hot path (the suite
+  // sends clean paths; segments stay percent-encoded here and handleRest /
+  // the git routes decodeURIComponent each segment, as before).
+  const rawUrl = req.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+  const queryString = qIndex >= 0 ? rawUrl.slice(qIndex + 1) : '';
   const method = req.method ?? 'GET';
   const segments = splitPath(pathname);
 
@@ -137,8 +172,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 401, { message: 'Requires authentication' });
       return;
     }
-    const raw = await readBody(req);
-    const result = handleMcp(raw.toString('utf8'));
+    const raw = await readTextBody(req);
+    const result = handleMcp(raw);
     if (result.json === null) {
       res.writeHead(result.status, { 'x-github-request-id': nextRequestId(), ...(result.headers ?? {}) });
       res.end();
@@ -154,8 +189,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 401, { message: 'Requires authentication' });
       return;
     }
-    const raw = await readBody(req);
-    const parsed = parseJsonBody(raw);
+    const raw = await readTextBody(req);
+    const parsed = parseJsonText(raw);
     if (!parsed.ok) {
       sendJson(res, 400, { errors: [{ message: 'Request body is not valid JSON' }] });
       return;
@@ -163,6 +198,66 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const result = handleGraphql(parsed.value);
     sendJson(res, result.status, result.json);
     return;
+  }
+
+  // Fast paths for the benchmark's hot REST routes: GET a single issue
+  // (2,000 sequential reads) and POST a new issue (200 sequential writes).
+  // Same auth, same owner binding, same statuses and same response bytes as
+  // handleRest — only the dispatch overhead (splitPath array, URLSearchParams,
+  // the route chain) is skipped. Anything shaped differently falls through
+  // to the generic branch below.
+  if (pathname.startsWith('/api/v3/repos/')) {
+    const rest = pathname.slice('/api/v3/repos/'.length);
+    const slash = rest.indexOf('/');
+    if (slash > 0) {
+      const owner = decodeURIComponent(rest.slice(0, slash));
+      const tail = rest.slice(slash + 1);
+      const slash2 = tail.indexOf('/');
+      const repoName = decodeURIComponent(slash2 >= 0 ? tail.slice(0, slash2) : tail);
+      const sub = slash2 >= 0 ? tail.slice(slash2 + 1) : '';
+      if (method === 'GET' && sub.startsWith('issues/') && !sub.slice('issues/'.length).includes('/')) {
+        if (!authorized(req)) {
+          sendJson(res, 401, { message: 'Requires authentication' });
+          return;
+        }
+        const repo = store.findRepo(owner, repoName);
+        if (repo === null) {
+          sendJson(res, 404, { message: 'Not Found' });
+          return;
+        }
+        const result = getIssueResult(repo, Number(sub.slice('issues/'.length)));
+        if (result.body !== undefined) {
+          sendBuffer(res, result.status, 'application/json', result.body, result.headers);
+        } else {
+          sendJson(res, result.status, result.json, result.headers);
+        }
+        return;
+      }
+      if (method === 'POST' && sub === 'issues') {
+        if (!authorized(req)) {
+          sendJson(res, 401, { message: 'Requires authentication' });
+          return;
+        }
+        const repo = store.findRepo(owner, repoName);
+        if (repo === null) {
+          sendJson(res, 404, { message: 'Not Found' });
+          return;
+        }
+        const raw = await readTextBody(req);
+        const parsed = parseJsonText(raw);
+        if (!parsed.ok) {
+          sendJson(res, 400, { message: 'Request body is not valid JSON' });
+          return;
+        }
+        const result = createIssueResult(repo, parsed.value);
+        if (result.body !== undefined) {
+          sendBuffer(res, result.status, 'application/json', result.body, result.headers);
+        } else {
+          sendJson(res, result.status, result.json, result.headers);
+        }
+        return;
+      }
+    }
   }
 
   // REST v3.
@@ -176,8 +271,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     }
     let body: unknown = null;
     if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
-      const raw = await readBody(req);
-      const parsed = parseJsonBody(raw);
+      const raw = await readTextBody(req);
+      const parsed = parseJsonText(raw);
       if (!parsed.ok) {
         sendJson(res, 400, { message: 'Request body is not valid JSON' });
         return;
@@ -185,8 +280,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       body = parsed.value;
     }
     const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
-    const result = handleRest(method, restSegments, url.searchParams, body, origin);
-    sendJson(res, result.status, result.json, result.headers);
+    const result = handleRest(method, restSegments, queryString === '' ? EMPTY_QUERY : new URLSearchParams(queryString), body, origin);
+    if (result.body !== undefined) {
+      sendBuffer(res, result.status, 'application/json', result.body, result.headers);
+    } else {
+      sendJson(res, result.status, result.json, result.headers);
+    }
     return;
   }
 
@@ -205,7 +304,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendJson(res, 404, { message: 'Not Found' });
       return;
     }
-    const service = url.searchParams.get('service') ?? '';
+    const service = new URLSearchParams(queryString).get('service') ?? '';
     if (service === 'git-upload-pack') {
       // Protocol v2 only when the client asks for it; a v0 client gets the
       // v0 ref advertisement instead.

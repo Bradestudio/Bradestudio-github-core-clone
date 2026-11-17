@@ -795,6 +795,7 @@ class Executor {
       }
       issue.state = 'closed';
       issue.updatedAt = nowIso();
+      issue.jsonCache = null;
       return { __kind: 'CloseIssuePayload', repo, issue } as TypedValue;
     }
     if (name === 'createPullRequest') {
@@ -865,6 +866,7 @@ class Executor {
       const comment = { id: repo.nextComment, body: text, createdAt: stamp, updatedAt: stamp };
       repo.nextComment += 1;
       issue.comments.push(comment);
+      issue.jsonCache = null;
       return { __kind: 'AddCommentPayload', repo, issue, comment } as TypedValue;
     }
     return undefined;

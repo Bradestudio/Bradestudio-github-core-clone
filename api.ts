@@ -27,6 +27,8 @@ export interface RestResult {
   status: number;
   json: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialised JSON body; when present the HTTP layer sends it as-is. */
+  body?: Buffer;
 }
 
 const ok = (json: unknown, status = 200, headers?: Record<string, string>): RestResult => ({ status, json, headers });
@@ -113,6 +115,28 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
   };
+}
+
+/**
+ * The issue's JSON text + Buffer, cached on the issue until it mutates.
+ * A label's colour is fixed at creation and the viewer login is learned
+ * before any issue can exist, so the only staleness sources are a PATCH
+ * (state/title/body/updatedAt) and a new comment — both clear jsonCache.
+ * Byte-identical to JSON.stringify(issueJson(...)).
+ */
+export function issueJsonText(repo: Repo, issue: Issue): { text: string; buf: Buffer } {
+  const viewer = store.viewerLogin();
+  const cached = issue.jsonCache;
+  if (cached !== null && cached.viewer === viewer) return cached;
+  const text = JSON.stringify(issueJson(repo, issue));
+  const out = { text, buf: Buffer.from(text, 'utf8'), viewer };
+  issue.jsonCache = out;
+  return out;
+}
+
+/** A REST result carrying the issue's cached serialisation (no re-stringify). */
+export function issueResult(repo: Repo, issue: Issue, status = 200): RestResult {
+  return { status, json: null, body: issueJsonText(repo, issue).buf };
 }
 
 function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
@@ -239,6 +263,7 @@ function commitFile(
   });
   const commitOid = putObject(repo, 'commit', commitData);
   repo.refs.set(refName, commitOid);
+  repo.refsVersion += 1;
   clearFetchCache();
   return commitOid;
 }
@@ -376,6 +401,7 @@ export function mergePullRequest(repo: Repo, pull: Pull): string | null {
   });
   const mergeSha = putObject(repo, 'commit', commitData);
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  repo.refsVersion += 1;
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = nowIso();
@@ -553,6 +579,7 @@ function handleGitRefs(method: string, segments: string[], repo: Repo, body: unk
     if (!repo.objects.has(sha)) return err(422, 'Object does not exist');
     if (repo.refs.has(ref)) return err(422, 'Reference already exists');
     repo.refs.set(ref, sha);
+    repo.refsVersion += 1;
     clearFetchCache();
     return ok({ ref, object: { sha, type: repo.objects.get(sha)!.type } }, 201);
   }
@@ -653,6 +680,27 @@ function handleContents(
   return err(404, 'Not Found');
 }
 
+/** POST /repos/{o}/{r}/issues: validate and create, shared by handleIssues and the app's fast path. */
+export function createIssueResult(repo: Repo, body: unknown): RestResult {
+  const input = parseBodyObject(body);
+  const title = typeof input.title === 'string' ? input.title : '';
+  const issueBody = typeof input.body === 'string' ? input.body : '';
+  const labels = Array.isArray(input.labels) ? input.labels.filter((entry): entry is string => typeof entry === 'string') : [];
+  for (const label of labels) {
+    if (!repo.labels.has(label)) return err(422, `Label "${label}" does not exist`);
+  }
+  const issue = store.createIssue(repo, title, issueBody, labels);
+  return issueResult(repo, issue, 201);
+}
+
+/** GET /repos/{o}/{r}/issues/{number}: the single-issue read, shared by handleIssues and the app's fast path. */
+export function getIssueResult(repo: Repo, number: number): RestResult {
+  if (!Number.isInteger(number) || number <= 0) return err(404, 'Not Found');
+  const issue = repo.issueByNumber.get(number);
+  if (issue === undefined) return err(404, 'Not Found');
+  return issueResult(repo, issue);
+}
+
 function handleIssues(
   method: string,
   segments: string[],
@@ -662,15 +710,7 @@ function handleIssues(
 ): RestResult {
   if (segments.length === 4) {
     if (method === 'POST') {
-      const input = parseBodyObject(body);
-      const title = typeof input.title === 'string' ? input.title : '';
-      const issueBody = typeof input.body === 'string' ? input.body : '';
-      const labels = Array.isArray(input.labels) ? input.labels.filter((entry): entry is string => typeof entry === 'string') : [];
-      for (const label of labels) {
-        if (!repo.labels.has(label)) return err(422, `Label "${label}" does not exist`);
-      }
-      const issue = store.createIssue(repo, title, issueBody, labels);
-      return ok(issueJson(repo, issue), 201);
+      return createIssueResult(repo, body);
     }
     if (method === 'GET') {
       const state = query.get('state') ?? 'open';
@@ -683,23 +723,26 @@ function handleIssues(
         list.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
       }
       const { page } = paginate(list, query);
-      return ok(page.map((issue) => issueJson(repo, issue)));
+      // Byte-identical to JSON.stringify(page.map(issueJson)): the cached
+      // texts carry the same key order as the objects they were built from.
+      const text = `[${page.map((issue) => issueJsonText(repo, issue).text).join(',')}]`;
+      return { status: 200, json: null, body: Buffer.from(text, 'utf8') };
     }
     return err(404, 'Not Found');
   }
   const number = Number(segments[4]);
-  if (!Number.isInteger(number) || number <= 0) return err(404, 'Not Found');
   const issue = repo.issueByNumber.get(number);
   if (segments.length === 5) {
+    if (method === 'GET') return getIssueResult(repo, number);
     if (issue === undefined) return err(404, 'Not Found');
-    if (method === 'GET') return ok(issueJson(repo, issue));
     if (method === 'PATCH') {
       const input = parseBodyObject(body);
       if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
       if (typeof input.title === 'string') issue.title = input.title;
       if (typeof input.body === 'string') issue.body = input.body;
       issue.updatedAt = nowIso();
-      return ok(issueJson(repo, issue));
+      issue.jsonCache = null;
+      return issueResult(repo, issue);
     }
     return err(404, 'Not Found');
   }
@@ -712,6 +755,7 @@ function handleIssues(
       const comment = { id: repo.nextComment, body: text, createdAt: stamp, updatedAt: stamp };
       repo.nextComment += 1;
       issue.comments.push(comment);
+      issue.jsonCache = null;
       return ok(commentJson(repo, issue, comment), 201);
     }
     if (method === 'GET') {
